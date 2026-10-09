@@ -8,6 +8,7 @@ Run inside AWS CloudShell (us-east-1):
     python3 deploy.py opensearch                         # domain + index + load (~20 min)
     python3 deploy.py test --email you@example.com       # scripted chat through the live API
     python3 deploy.py status                             # print URLs / ids
+    python3 deploy.py logs LF1                           # recent Lambda logs (debugging)
     python3 deploy.py delete-opensearch                  # stop OpenSearch billing
     python3 deploy.py destroy                            # remove everything
 
@@ -640,6 +641,25 @@ def cmd_test(args):
     print(f"\nTo test the 'same as last time' extra credit: python3 deploy.py test --repeat --session {sid}")
 
 
+def cmd_logs(args):
+    """Print the last few minutes of a Lambda's CloudWatch logs (useful for debugging the bot)."""
+    logs = session.client("logs")
+    start = int((time.time() - args.minutes * 60) * 1000)
+    kw = {"logGroupName": f"/aws/lambda/{args.function}", "startTime": start, "interleaved": True}
+    try:
+        while True:
+            page = logs.filter_log_events(**kw)
+            for e in page["events"]:
+                line = e["message"].rstrip()
+                if not line.startswith(("START", "END", "REPORT", "INIT_START")):
+                    print(line)
+            if "nextToken" not in page:
+                break
+            kw["nextToken"] = page["nextToken"]
+    except ClientError as e:
+        print(f"no logs yet for {args.function} ({code(e)})")
+
+
 def cmd_status(args):
     st = load_state()
     print("\n" + "=" * 70)
@@ -735,6 +755,8 @@ def main():
     p.add_argument("--repeat", action="store_true"); p.add_argument("--run-worker", action="store_true")
     p.set_defaults(fn=cmd_test)
     sub.add_parser("status").set_defaults(fn=cmd_status)
+    p = sub.add_parser("logs"); p.add_argument("function", nargs="?", default="LF1", choices=list(LAMBDAS))
+    p.add_argument("--minutes", type=int, default=30); p.set_defaults(fn=cmd_logs)
     sub.add_parser("delete-opensearch").set_defaults(fn=cmd_delete_opensearch)
     sub.add_parser("destroy").set_defaults(fn=cmd_destroy)
     args = ap.parse_args()

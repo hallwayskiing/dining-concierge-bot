@@ -76,9 +76,11 @@ def set_slot(slots, name, value):
 
 def elicit(event, slots, slot_name, message, attrs=None):
     intent = event["sessionState"]["intent"]
+    attrs = attrs if attrs is not None else dict(event["sessionState"].get("sessionAttributes") or {})
+    attrs["eliciting"] = slot_name
     return {
         "sessionState": {
-            "sessionAttributes": attrs if attrs is not None else event["sessionState"].get("sessionAttributes", {}),
+            "sessionAttributes": attrs,
             "dialogAction": {"type": "ElicitSlot", "slotToElicit": slot_name},
             "intent": {"name": intent["name"], "slots": slots, "state": "InProgress"},
         },
@@ -88,6 +90,8 @@ def elicit(event, slots, slot_name, message, attrs=None):
 
 def close(event, message, slots=None, attrs=None):
     intent = event["sessionState"]["intent"]
+    attrs = attrs if attrs is not None else dict(event["sessionState"].get("sessionAttributes") or {})
+    attrs.pop("eliciting", None)
     return {
         "sessionState": {
             "sessionAttributes": attrs if attrs is not None else event["sessionState"].get("sessionAttributes", {}),
@@ -100,6 +104,50 @@ def close(event, message, slots=None, attrs=None):
 
 
 # ---------------------------------------------------------------- validation
+PERIODS = {"MO": "09:00", "AF": "14:00", "EV": "19:00", "NI": "21:00"}  # Lex values for "morning", "evening"...
+TIME_RE = re.compile(r"\b(\d{1,2})(?:[:.](\d{2}))?(?::\d{2})?\s*(a\.?\s?m\.?|p\.?\s?m\.?)?(?![\d.])", re.I)
+WORD_TIMES = {"noon": "12:00", "midday": "12:00", "midnight": "00:00", "tonight": "19:00",
+              "evening": "19:00", "dinner": "19:00", "lunch": "12:00", "afternoon": "14:00"}
+
+
+def parse_time(*candidates):
+    """Normalize anything Lex (or the user) gives us to HH:MM, or None.
+
+    Lex V2's AMAZON.Time can return "19:00", "19:00:00", ambiguous resolved values ["07:00", "19:00"],
+    a period code like "EV", or only the raw text ("7 pm, please"). A bare hour is read as dinner time.
+    """
+    for c in candidates:
+        if not c:
+            continue
+        c = str(c).strip()
+        if c.upper() in PERIODS:
+            return PERIODS[c.upper()]
+        low = c.lower()
+        for word, hhmm in WORD_TIMES.items():
+            if re.search(r"\b" + word + r"\b", low) and not re.search(r"\d", low):
+                return hhmm
+        m = TIME_RE.search(c)
+        if not m:
+            continue
+        hh, mm, mer = int(m.group(1)), int(m.group(2) or 0), (m.group(3) or "").lower().replace(".", "").replace(" ", "")
+        if mm > 59 or hh > 23:
+            continue
+        if mer == "pm" and hh < 12:
+            hh += 12
+        elif mer == "am" and hh == 12:
+            hh = 0
+        elif not mer and 1 <= hh <= 10 and m.group(2) is None:
+            hh += 12  # "7" -> 19:00
+        return f"{hh:02d}:{mm:02d}"
+    return None
+
+
+def time_candidates(slots, transcript):
+    v = ((slots or {}).get("DiningTime") or {}).get("value") or {}
+    # For ambiguous input Lex gives resolvedValues like ["07:00", "19:00"]: try the later (evening) one first.
+    return [v.get("interpretedValue"), *reversed(v.get("resolvedValues") or []), v.get("originalValue"), transcript]
+
+
 def normalize_location(text):
     t = text.lower()
     return "Manhattan" if any(w in t for w in LOCATION_WORDS) else None
@@ -117,8 +165,11 @@ def now_ny():
     return datetime.now(NY_TZ)
 
 
-def validate(slots):
-    """Return (slot_name, error_message) for the first invalid slot, normalizing values in place."""
+def validate(slots, transcript=None, eliciting=None):
+    """Return (slot_name, error_message) for the first invalid slot, normalizing values in place.
+
+    `eliciting` is the slot we asked for last turn; if Lex couldn't fill it, we try the raw transcript.
+    """
     loc = slot_text(slots, "Location")
     if loc is not None:
         norm = normalize_location(loc)
@@ -135,6 +186,12 @@ def validate(slots):
         set_slot(slots, "Cuisine", norm)
 
     num = slot_text(slots, "NumberOfPeople")
+    if num is None and eliciting == "NumberOfPeople" and transcript:
+        words = {w: str(i) for i, w in enumerate("zero one two three four five six seven eight nine ten eleven "
+                                                 "twelve thirteen fourteen fifteen sixteen seventeen eighteen "
+                                                 "nineteen twenty".split())}
+        m = re.search(r"\d+", transcript) or re.search(r"\b(" + "|".join(words) + r")\b", transcript.lower())
+        num = (m.group(0) if m.group(0).isdigit() else words[m.group(0)]) if m else "0"
     if num is not None:
         try:
             n = int(float(num))
@@ -154,10 +211,12 @@ def validate(slots):
         if dining_date < now_ny().date():
             return "DiningDate", "That date has already passed. What date would you like to dine?"
 
-    t = slot_text(slots, "DiningTime")
+    raw_t = slot_text(slots, "DiningTime")
+    from_transcript = transcript if eliciting == "DiningTime" else None
+    t = parse_time(*time_candidates(slots, from_transcript)) if (raw_t or from_transcript) else None
+    if (raw_t or from_transcript) and t is None:
+        return "DiningTime", "Sorry, I didn't catch the time. Please give me a time like 7 pm or 19:30."
     if t is not None:
-        if not re.fullmatch(r"\d{2}:\d{2}", t):
-            return "DiningTime", "Please give me a specific time, like 7 pm."
         if dining_date and dining_date == now_ny().date():
             hh, mm = map(int, t.split(":"))
             if (hh, mm) <= (now_ny().hour, now_ny().minute):
@@ -217,7 +276,10 @@ def handle_dining(event):
         for k in ("sameAsLastResolved", "sameAsLastTries"):
             attrs.pop(k, None)
 
-    bad_slot, error = validate(slots)
+    eliciting = attrs.pop("eliciting", None)
+    if slot_text(slots, "Location") is None:  # fresh request: ignore what an abandoned one was asking
+        eliciting = None
+    bad_slot, error = validate(slots, event.get("inputTranscript"), eliciting)
     if bad_slot:
         set_slot(slots, bad_slot, None)
         return elicit(event, slots, bad_slot, error, attrs)
@@ -274,7 +336,10 @@ def handle_dining(event):
 
 
 def lambda_handler(event, context):
-    print(json.dumps({k: event.get(k) for k in ("sessionId", "inputTranscript", "invocationSource")}))
+    intent = event["sessionState"]["intent"]
+    print(json.dumps({"sessionId": event.get("sessionId"), "inputTranscript": event.get("inputTranscript"),
+                      "source": event.get("invocationSource"), "intent": intent.get("name"),
+                      "slots": {k: (v or {}).get("value") for k, v in (intent.get("slots") or {}).items()}}))
     name = event["sessionState"]["intent"]["name"]
     if name == "GreetingIntent":
         return close(event, "Hi there, how can I help?")

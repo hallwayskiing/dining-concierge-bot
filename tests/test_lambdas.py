@@ -209,3 +209,44 @@ def test_lf2_sends_email_and_remembers(aws, monkeypatch):
 def test_lf2_real_ses_call(aws, monkeypatch):
     lf2 = load("lf2")
     lf2.send_email("me@nyu.edu", "subj", "body")  # moto validates the SES call shape
+
+
+@pytest.mark.parametrize("candidates, expected", [
+    (["19:00"], "19:00"), (["19:00:00"], "19:00"), (["EV"], "19:00"), ([None, "19:00", "07:00"], "19:00"),
+    ([None, None, "7 pm, please"], "19:00"), ([None, None, None, "7pm please"], "19:00"),
+    (["7:30 p.m."], "19:30"), (["12 am"], "00:00"), (["noon"], "12:00"), (["7"], "19:00"),
+    (["11:45"], "11:45"), (["at 8:15 PM"], "20:15"), (["tomorrow"], None), (["yn2465@nyu.edu"], None),
+])
+def test_parse_time(aws, candidates, expected):
+    assert load("lf1").parse_time(*candidates) == expected
+
+
+def test_time_lex_returns_odd_values(aws):
+    """Regression for the live run: Lex gave a non-HH:MM time for '7 pm, please'."""
+    lf1 = load("lf1")
+    for value in ({"originalValue": "7 pm, please", "interpretedValue": "19:00:00", "resolvedValues": ["19:00:00"]},
+                  {"originalValue": "7 pm, please", "resolvedValues": []},
+                  {"originalValue": "7 pm, please", "interpretedValue": "EV", "resolvedValues": ["EV"]}):
+        bot = Lex(lf1)
+        bot.say("I need restaurant suggestions", "DiningSuggestionsIntent")
+        for line in ["Manhattan", "Japanese", "Two", "Tomorrow"]:
+            bot.say(line)
+        bot.value = lambda slot, text, v=value: v
+        text, _ = bot.say("7 pm, please")
+        assert text.startswith("Great. Lastly, I need your email"), (value, text)
+        assert bot.slots["DiningTime"]["value"]["interpretedValue"] in ("19:00",)
+
+
+def test_time_slot_not_filled_uses_transcript(aws):
+    """If Lex can't fill AMAZON.Time at all, the dialog hook still gets the raw transcript."""
+    lf1 = load("lf1")
+    bot = Lex(lf1)
+    bot.say("I need restaurant suggestions", "DiningSuggestionsIntent")
+    for line in ["Manhattan", "Japanese", "Two", "Tomorrow"]:
+        bot.say(line)
+    event = {"sessionId": bot.session, "inputTranscript": "around 7:30pm please", "invocationSource": "DialogCodeHook",
+             "sessionState": {"sessionAttributes": bot.attrs,
+                              "intent": {"name": bot.intent, "slots": bot.slots, "state": "InProgress"}}}
+    out = lf1.lambda_handler(event, None)
+    assert out["sessionState"]["intent"]["slots"]["DiningTime"]["value"]["interpretedValue"] == "19:30"
+    assert out["sessionState"]["dialogAction"]["slotToElicit"] == "Email"
